@@ -266,7 +266,7 @@ def train_group(
         load_best_model_at_end=True,
         metric_for_best_model="mcc",
         greater_is_better=True,
-        logging_steps=50,
+        logging_strategy="epoch",
         report_to="none",
         seed=args.seed,
         fp16=args.fp16,
