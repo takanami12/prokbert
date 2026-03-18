@@ -3,12 +3,9 @@
 ProkBERT Finetuning with Length-Based Groups
 =============================================
 
-Follows the Colab notebook workflow (AutoTokenizer + AutoModelForSequenceClassification)
-but reads a local FASTA file + labels.csv.
-
-Input:
-  - A FASTA file containing genome sequences
-  - A labels.csv with columns: genome_id, label [, length, source]
+Uses the same pipeline as finetuning.py (BertForBinaryClassificationWithPooling +
+ProkBERT internal tokenizer + ProkBERTTrainingDatasetPT) but reads a local
+FASTA file + labels.csv instead of the HuggingFace dataset.
 
 Preprocessing:
   1. Load genomes from FASTA
@@ -18,18 +15,18 @@ Preprocessing:
        Group B: 400-800 bp
        Group C: 800-1200 bp
        Group D: 1200-1800 bp
-  4. Tokenize with AutoTokenizer (same as Colab notebook)
-  5. Train/eval split per genome (no data leakage)
-  6. Finetune with HuggingFace Trainer
+  4. Train/eval split per genome (no data leakage)
+  5. Tokenize with ProkBERT internal tokenizer
+  6. Finetune with HuggingFace Trainer + BertForBinaryClassificationWithPooling
 
 Usage:
-    python finetuning_groups.py \
-        --fasta /path/to/genomes.fasta \
-        --labels_csv /path/to/labels.csv \
-        --output_dir ./finetune_results \
-        --model_name neuralbioinfo/prokbert-mini \
-        --num_epochs 5 \
-        --batch_size 128 \
+    python finetuning_groups.py \\
+        --fasta /path/to/genomes.fasta \\
+        --labels_csv /path/to/labels.csv \\
+        --output_dir ./finetune_results \\
+        --model_name neuralbioinfo/prokbert-mini \\
+        --num_epochs 5 \\
+        --batch_size 128 \\
         --bf16
 """
 
@@ -37,26 +34,24 @@ import argparse
 import logging
 import os
 import json
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 from Bio import SeqIO
-from datasets import Dataset
-from sklearn.metrics import (
-    accuracy_score,
-    matthews_corrcoef,
-    recall_score,
-    roc_auc_score,
-)
 from sklearn.model_selection import train_test_split
-from transformers import (
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    Trainer,
-    TrainingArguments,
+from transformers import TrainingArguments, Trainer
+
+from prokbert import helper
+from prokbert.sequtils import check_nvidia_gpu
+from prokbert.training_utils import (
+    get_default_pretrained_model_parameters,
+    get_torch_data_from_segmentdb_classification,
+    compute_metrics_eval_prediction,
 )
+from prokbert.models import BertForBinaryClassificationWithPooling
+from prokbert.prok_datasets import ProkBERTTrainingDatasetPT
 
 logging.basicConfig(
     level=logging.INFO,
@@ -99,17 +94,7 @@ def sliding_window_segments(
     step_size: int,
     min_length: int = 0,
 ) -> List[str]:
-    """Cut a sequence into overlapping segments using a sliding window.
-
-    Args:
-        sequence: Nucleotide sequence string.
-        window_size: Window length in bp.
-        step_size: Step (stride) in bp.
-        min_length: Discard segments shorter than this.
-
-    Returns:
-        List of segment strings.
-    """
+    """Cut a sequence into overlapping segments using a sliding window."""
     segments = []
     seq_len = len(sequence)
     if seq_len < min_length:
@@ -120,7 +105,6 @@ def sliding_window_segments(
         seg = sequence[start:end]
         if len(seg) >= min_length:
             segments.append(seg)
-        # Stop if we've reached the end
         if end == seq_len:
             break
 
@@ -140,27 +124,22 @@ def build_segment_dataframe(
       - step_size = int(max_bp * step_fraction)
       - Only keep segments with length in [min_bp, max_bp]
 
-    Args:
-        fasta_path: Path to input FASTA file.
-        label_map: genome_id -> label mapping.
-        groups: Dict of group_name -> (min_bp, max_bp).
-        step_fraction: Fraction of window_size used as step.
-
-    Returns:
-        DataFrame with columns: segment, genome_id, y, group
+    Returns DataFrame with columns: segment_id, segment, sequence_id, y, label, group
+    (compatible with get_torch_data_from_segmentdb_classification)
     """
     records = list(SeqIO.parse(fasta_path, "fasta"))
     logger.info("Loaded %d records from %s", len(records), fasta_path)
 
     all_rows = []
     missing = []
+    segment_id = 0
 
     for record in records:
         genome_id = record.id
         if genome_id not in label_map:
             missing.append(genome_id)
             continue
-        label = label_map[genome_id]
+        label_int = label_map[genome_id]
         seq = str(record.seq).upper()
 
         for group_name, (min_bp, max_bp) in groups.items():
@@ -175,11 +154,14 @@ def build_segment_dataframe(
             )
             for seg in segments:
                 all_rows.append({
+                    "segment_id": segment_id,
                     "segment": seg,
-                    "genome_id": genome_id,
-                    "y": label,
+                    "sequence_id": genome_id,
+                    "y": label_int,
+                    "label": f"class_{label_int}",
                     "group": group_name,
                 })
+                segment_id += 1
 
     if missing:
         logger.warning(
@@ -197,7 +179,7 @@ def build_segment_dataframe(
 
 
 # ---------------------------------------------------------------------------
-# Train/val split by genome_id (no data leakage)
+# Train/val split by genome (no data leakage)
 # ---------------------------------------------------------------------------
 
 def split_by_genome(
@@ -205,10 +187,9 @@ def split_by_genome(
     test_size: float = 0.2,
     seed: int = 42,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Split data into train/val ensuring all segments from the same genome
-    end up in the same split (no data leakage)."""
-    genome_ids = df["genome_id"].unique()
-    labels_per_genome = df.groupby("genome_id")["y"].first()
+    """Split ensuring all segments from the same genome stay in the same split."""
+    genome_ids = df["sequence_id"].unique()
+    labels_per_genome = df.groupby("sequence_id")["y"].first()
 
     train_ids, val_ids = train_test_split(
         genome_ids,
@@ -216,8 +197,8 @@ def split_by_genome(
         random_state=seed,
         stratify=labels_per_genome.loc[genome_ids],
     )
-    train_df = df[df["genome_id"].isin(set(train_ids))].reset_index(drop=True)
-    val_df = df[df["genome_id"].isin(set(val_ids))].reset_index(drop=True)
+    train_df = df[df["sequence_id"].isin(set(train_ids))].reset_index(drop=True)
+    val_df = df[df["sequence_id"].isin(set(val_ids))].reset_index(drop=True)
     logger.info(
         "Split: %d train segments (%d genomes), %d val segments (%d genomes)",
         len(train_df), len(train_ids), len(val_df), len(val_ids),
@@ -226,86 +207,51 @@ def split_by_genome(
 
 
 # ---------------------------------------------------------------------------
-# Tokenization (same approach as Colab notebook)
-# ---------------------------------------------------------------------------
-
-def tokenize_function(examples, tokenizer):
-    """Tokenize segments following the Colab notebook approach."""
-    encoded = tokenizer.batch_encode_plus(
-        examples["segment"],
-        padding=True,
-        add_special_tokens=True,
-        return_tensors="pt",
-    )
-    input_ids = encoded["input_ids"]
-    attention_mask = encoded["attention_mask"]
-
-    # Mask special tokens 2 ([CLS]) and 3 ([SEP]) as done in notebook
-    mask_tokens = (input_ids == 2) | (input_ids == 3)
-    attention_mask[mask_tokens] = 0
-
-    y = torch.tensor(examples["y"], dtype=torch.int64)
-
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "labels": y,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Metrics (same as Colab notebook)
-# ---------------------------------------------------------------------------
-
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    predictions = logits.argmax(axis=-1)
-
-    mcc = matthews_corrcoef(labels, predictions)
-    acc = accuracy_score(labels, predictions)
-    recall = recall_score(labels, predictions, average="weighted")
-
-    try:
-        if logits.shape[1] == 2:
-            roc_auc = roc_auc_score(labels, logits[:, 1])
-        else:
-            roc_auc = roc_auc_score(labels, logits, multi_class="ovr")
-    except ValueError:
-        roc_auc = float("nan")
-
-    return {
-        "mcc": mcc,
-        "accuracy": acc,
-        "recall": recall,
-        "roc_auc": roc_auc,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Training
+# Training (same as finetuning.py)
 # ---------------------------------------------------------------------------
 
 def train_group(
     group_name: str,
-    train_ds: Dataset,
-    val_ds: Dataset,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
     model_name: str,
     output_dir: str,
     args: argparse.Namespace,
 ) -> Dict:
-    """Train one group and return metrics."""
+    """Train one group using the same pipeline as finetuning.py."""
     logger.info("=" * 60)
-    logger.info("GROUP %s — train: %d, val: %d", group_name, len(train_ds), len(val_ds))
+    logger.info("GROUP %s — train: %d segments, val: %d segments",
+                group_name, len(train_df), len(val_df))
     logger.info("=" * 60)
 
     group_output = os.path.join(output_dir, f"group_{group_name}")
     os.makedirs(group_output, exist_ok=True)
 
-    # Load model fresh for each group
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_name, trust_remote_code=True
+    # ---- Model & tokenizer (same as finetuning.py) ----
+    pretrained_model, tokenizer = get_default_pretrained_model_parameters(
+        model_name=model_name,
+        model_class='MegatronBertModel',
+        output_hidden_states=False,
+        output_attentions=False,
+        move_to_gpu=False,
+    )
+    model = BertForBinaryClassificationWithPooling(pretrained_model)
+
+    # ---- Tokenize with ProkBERT tokenizer (same as finetuning.py) ----
+    print(f'Processing train data for group {group_name}!')
+    [X_train, y_train, torchdb_train] = get_torch_data_from_segmentdb_classification(
+        tokenizer, train_df
+    )
+    print(f'Processing val data for group {group_name}!')
+    [X_val, y_val, torchdb_val] = get_torch_data_from_segmentdb_classification(
+        tokenizer, val_df
     )
 
+    # ---- Create datasets (same as finetuning.py) ----
+    train_ds = ProkBERTTrainingDatasetPT(X_train, y_train, AddAttentionMask=True)
+    val_ds = ProkBERTTrainingDatasetPT(X_val, y_val, AddAttentionMask=True)
+
+    # ---- Training args ----
     training_args = TrainingArguments(
         output_dir=group_output,
         overwrite_output_dir=True,
@@ -327,14 +273,16 @@ def train_group(
         bf16=args.bf16,
         dataloader_num_workers=args.dataloader_num_workers,
         save_total_limit=2,
+        remove_unused_columns=False,
     )
 
+    # ---- Trainer (same as finetuning.py) ----
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        compute_metrics=compute_metrics,
+        compute_metrics=compute_metrics_eval_prediction,
     )
 
     trainer.train()
@@ -343,10 +291,10 @@ def train_group(
     metrics = trainer.evaluate()
     logger.info("Group %s metrics: %s", group_name, metrics)
 
-    # Save best model
+    # Save model (same as finetuning.py)
     best_path = os.path.join(group_output, "best_model")
-    trainer.save_model(best_path)
-    logger.info("Saved best model to %s", best_path)
+    model.save_pretrained(best_path)
+    logger.info("Saved model to %s", best_path)
 
     return {"group": group_name, **metrics}
 
@@ -387,8 +335,8 @@ def parse_args():
 
 def main():
     args = parse_args()
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    helper.set_seed(args.seed)
+    check_nvidia_gpu()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -417,10 +365,6 @@ def main():
     # Split by genome
     train_df, val_df = split_by_genome(seg_df, test_size=args.test_size, seed=args.seed)
 
-    # Load tokenizer once
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-    num_cores = os.cpu_count() or 1
-
     # Train each group
     all_metrics = []
     for group_name in sorted(selected_groups.keys()):
@@ -434,25 +378,16 @@ def main():
             logger.warning("Group %s has no validation data, skipping.", group_name)
             continue
 
-        logger.info("Tokenizing group %s (train=%d, val=%d) ...", group_name, len(g_train), len(g_val))
-
-        # Convert to HuggingFace Dataset and tokenize
-        train_hf = Dataset.from_pandas(g_train[["segment", "y"]])
-        val_hf = Dataset.from_pandas(g_val[["segment", "y"]])
-
-        train_tok = train_hf.map(
-            lambda ex: tokenize_function(ex, tokenizer),
-            batched=True, num_proc=num_cores, remove_columns=["segment"],
-        )
-        val_tok = val_hf.map(
-            lambda ex: tokenize_function(ex, tokenizer),
-            batched=True, num_proc=num_cores, remove_columns=["segment"],
-        )
+        # Re-assign segment_id for this group subset
+        g_train = g_train.copy()
+        g_train["segment_id"] = range(len(g_train))
+        g_val = g_val.copy()
+        g_val["segment_id"] = range(len(g_val))
 
         metrics = train_group(
             group_name=group_name,
-            train_ds=train_tok,
-            val_ds=val_tok,
+            train_df=g_train,
+            val_df=g_val,
             model_name=args.model_name,
             output_dir=args.output_dir,
             args=args,
