@@ -44,8 +44,8 @@ from sklearn.model_selection import train_test_split
 from transformers import TrainingArguments, Trainer
 
 from prokbert import helper
-from prokbert.sequtils import check_nvidia_gpu
 from prokbert.training_utils import (
+    check_nvidia_gpu,
     get_default_pretrained_model_parameters,
     get_torch_data_from_segmentdb_classification,
     compute_metrics_eval_prediction,
