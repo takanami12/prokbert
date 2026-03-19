@@ -237,14 +237,19 @@ def train_group(
     )
     model = BertForBinaryClassificationWithPooling(pretrained_model)
 
+    # Max token count = model's max_position_embeddings - 2 (for [CLS] and [SEP])
+    max_pos = pretrained_model.config.max_position_embeddings
+    L = max_pos - 2
+    logger.info("Max position embeddings: %d, truncating tokens to L=%d", max_pos, L)
+
     # ---- Tokenize with ProkBERT tokenizer (same as finetuning.py) ----
     print(f'Processing train data for group {group_name}!')
     [X_train, y_train, torchdb_train] = get_torch_data_from_segmentdb_classification(
-        tokenizer, train_df
+        tokenizer, train_df, L=L
     )
     print(f'Processing val data for group {group_name}!')
     [X_val, y_val, torchdb_val] = get_torch_data_from_segmentdb_classification(
-        tokenizer, val_df
+        tokenizer, val_df, L=L
     )
 
     # ---- Create datasets (same as finetuning.py) ----
