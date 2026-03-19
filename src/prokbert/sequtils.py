@@ -668,7 +668,7 @@ def get_rectangular_array_from_tokenized_dataset(tokenized_segments_data: Dict[i
     torch_id = 0
     for segment_id, tokenized_vectors in tokenized_segments_data.items():
         for offset in range(shift):
-            segment_vector = tokenized_vectors[offset]
+            segment_vector = tokenized_vectors[offset][:max_token_count]
             X[torch_id,0:segment_vector.shape[0]] = segment_vector
             torch_db.append([torch_id, segment_id, offset])
             torch_id+=1
