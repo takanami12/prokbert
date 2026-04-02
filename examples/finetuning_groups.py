@@ -41,6 +41,7 @@ import pandas as pd
 import torch
 from Bio import SeqIO
 from sklearn.model_selection import train_test_split
+from torch.utils.data import Dataset
 from transformers import TrainingArguments, Trainer
 
 from prokbert import helper
@@ -51,7 +52,42 @@ from prokbert.training_utils import (
     compute_metrics_eval_prediction,
 )
 from prokbert.models import BertForBinaryClassificationWithPooling
-from prokbert.prok_datasets import ProkBERTTrainingDatasetPT
+
+
+# ---------------------------------------------------------------------------
+# Variable-length dataset + dynamic padding (avoids wasting GPU on pad tokens)
+# ---------------------------------------------------------------------------
+
+class VariableLengthDataset(Dataset):
+    """Stores each sequence trimmed to its actual length; padding is deferred
+    to the per-batch collator so short sequences don't waste GPU cycles."""
+
+    def __init__(self, X: torch.Tensor, y: torch.Tensor):
+        self.y = y
+        nonzero = X != 0
+        self.lengths = nonzero.long().sum(dim=1)
+        self.seqs = [X[i, : self.lengths[i]].clone() for i in range(len(X))]
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return {"input_ids": self.seqs[idx], "labels": self.y[idx]}
+
+
+def dynamic_padding_collator(batch):
+    """Pad to the max length within the batch and build attention masks."""
+    max_len = max(item["input_ids"].size(0) for item in batch)
+    input_ids = torch.zeros(len(batch), max_len, dtype=torch.long)
+    attention_mask = torch.zeros(len(batch), max_len, dtype=torch.float)
+    labels = torch.stack([item["labels"] for item in batch])
+    for i, item in enumerate(batch):
+        seq = item["input_ids"]
+        length = seq.size(0)
+        input_ids[i, :length] = seq
+        mask = (seq > 3) | (seq == 1) | (seq == 2)
+        attention_mask[i, :length] = mask.float()
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -252,9 +288,23 @@ def train_group(
         tokenizer, val_df, L=L
     )
 
-    # ---- Create datasets (same as finetuning.py) ----
-    train_ds = ProkBERTTrainingDatasetPT(X_train, y_train, AddAttentionMask=True)
-    val_ds = ProkBERTTrainingDatasetPT(X_val, y_val, AddAttentionMask=True)
+    # ---- Move to GPU and compile ----
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    logger.info("Model device: %s | params: %.1fM", device,
+                sum(p.numel() for p in model.parameters()) / 1e6)
+    if torch.cuda.is_available() and hasattr(torch, "compile"):
+        logger.info("Applying torch.compile(mode='reduce-overhead') …")
+        model = torch.compile(model, mode="reduce-overhead")
+
+    # ---- Create datasets with dynamic padding ----
+    train_ds = VariableLengthDataset(X_train, y_train)
+    val_ds = VariableLengthDataset(X_val, y_val)
+    train_lens = train_ds.lengths.float()
+    logger.info(
+        "Group %s train lengths — mean: %.0f, median: %.0f, max: %d",
+        group_name, train_lens.mean(), train_lens.median(), train_lens.max().item(),
+    )
 
     # ---- Training args ----
     training_args = TrainingArguments(
@@ -277,16 +327,20 @@ def train_group(
         fp16=args.fp16,
         bf16=args.bf16,
         dataloader_num_workers=args.dataloader_num_workers,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         save_total_limit=2,
         remove_unused_columns=False,
+        dataloader_pin_memory=True,
+        optim="adamw_torch_fused",
     )
 
-    # ---- Trainer (same as finetuning.py) ----
+    # ---- Trainer ----
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
+        data_collator=dynamic_padding_collator,
         compute_metrics=compute_metrics_eval_prediction,
     )
 
@@ -296,9 +350,10 @@ def train_group(
     metrics = trainer.evaluate()
     logger.info("Group %s metrics: %s", group_name, metrics)
 
-    # Save model (same as finetuning.py)
+    # Save model — unwrap torch.compile wrapper before save_pretrained
     best_path = os.path.join(group_output, "best_model")
-    model.save_pretrained(best_path)
+    orig_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    orig_model.save_pretrained(best_path)
     logger.info("Saved model to %s", best_path)
 
     return {"group": group_name, **metrics}
@@ -321,7 +376,7 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="./finetune_results")
     parser.add_argument("--num_epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--learning_rate", type=float, default=4e-4)
+    parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--test_size", type=float, default=0.2, help="Fraction for validation")
@@ -330,7 +385,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 (A100/H100)")
-    parser.add_argument("--dataloader_num_workers", type=int, default=2)
+    parser.add_argument("--dataloader_num_workers", type=int, default=4)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument(
         "--groups", type=str, nargs="+", default=None,
         help="Specific groups to train (e.g. A B). Default: all (A B C D)",
@@ -342,6 +398,11 @@ def main():
     args = parse_args()
     helper.set_seed(args.seed)
     check_nvidia_gpu()
+
+    # Enable TF32 on Ampere+ GPUs (A100/H100) for faster fp32 math
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision('high')
 
     os.makedirs(args.output_dir, exist_ok=True)
 
