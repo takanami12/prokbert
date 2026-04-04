@@ -36,6 +36,9 @@ import os
 import json
 from typing import Dict, List, Tuple
 
+# Forcefully disable torch.compile / dynamo to avoid CUDA graphs conflicts
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
+
 import numpy as np
 import pandas as pd
 import torch
@@ -330,9 +333,7 @@ def train_group(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         save_total_limit=2,
         remove_unused_columns=False,
-        dataloader_pin_memory=True,
-        optim="adamw_torch_fused",
-        torch_compile=False
+        torch_compile=False,
     )
 
     # ---- Trainer ----
