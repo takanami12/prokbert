@@ -332,6 +332,7 @@ def train_group(
         remove_unused_columns=False,
         dataloader_pin_memory=True,
         optim="adamw_torch_fused",
+        torch_compile=False
     )
 
     # ---- Trainer ----
