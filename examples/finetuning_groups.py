@@ -279,6 +279,7 @@ def train_group(
         dataloader_num_workers=args.dataloader_num_workers,
         save_total_limit=2,
         remove_unused_columns=False,
+        torch_compile=False,
     )
 
     # ---- Trainer (same as finetuning.py) ----
