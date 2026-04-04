@@ -36,6 +36,9 @@ import os
 import json
 from typing import Dict, List, Tuple
 
+# Forcefully disable torch.compile / dynamo to avoid CUDA graphs conflicts
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
+
 import numpy as np
 import pandas as pd
 import torch
